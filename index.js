@@ -1,6 +1,7 @@
 const { Telegraf } = require('telegraf');
 
-const bot = new Telegraf(process.env.TG_BOT_TOKEN);
+// Aapka token number direct code me fit kar diya hai
+const bot = new Telegraf('8672679589:AAFj7A3kMgNGxVB64XCaY_Laomll9RF3VBQ');
 
 bot.start((ctx) => ctx.reply('Bot Active hai! Video send karo (<20MB).'));
 
@@ -15,3 +16,4 @@ bot.on('video', async (ctx) => {
 });
 
 bot.launch();
+console.log("Bot chalu hai...");
