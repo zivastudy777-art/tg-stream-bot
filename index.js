@@ -1,6 +1,9 @@
 const { Telegraf } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
+const crypto = require('crypto');
+const { Readable } = require('stream');
+const { pipeline } = require('stream/promises');
 
 const app = express();
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -17,39 +20,39 @@ app.get('/', (req, res) => {
   res.send('Telegram video service running.');
 });
 
-// Receive videos from Telegram
+// Receive videos and save their information in Supabase
 bot.on('video', async (ctx) => {
   try {
     const video = ctx.message.video;
-    const key = video.file_unique_id;
+    const key = crypto.randomBytes(24).toString('hex');
 
     const { error } = await supabase
       .from('videos')
-      .upsert({
+      .insert({
         id: key,
         file_id: video.file_id,
         created_at: new Date().toISOString()
       });
 
     if (error) {
-      console.error('Supabase save error:', error.message);
-      await ctx.reply('Video save nahi ho payi. Please dobara try karo.');
+      console.error('Supabase error:', error.message);
+      await ctx.reply('Video save nahi hui. Please dobara try karo.');
       return;
     }
 
     const videoUrl = `${BASE_URL}/video/${key}`;
 
-    await ctx.reply(
-      `Video link:\n${videoUrl}`
-    );
+    await ctx.reply(`Video link:\n${videoUrl}`);
   } catch (error) {
     console.error('Video handler error:', error);
-    await ctx.reply('Kuch error aaya. Please dobara try karo.');
+    await ctx.reply('Video process nahi ho payi.');
   }
 });
 
-// Stream video in browser
+// Stream video with Range support for browser playback
 app.get('/video/:id', async (req, res) => {
+  let upstream;
+
   try {
     const { data, error } = await supabase
       .from('videos')
@@ -62,73 +65,77 @@ app.get('/video/:id', async (req, res) => {
     }
 
     const telegramFile = await bot.telegram.getFile(data.file_id);
-    const filePath = telegramFile.file_path;
+
+    if (!telegramFile.file_path) {
+      return res.status(404).send('Telegram video file nahi mili.');
+    }
 
     const fileUrl =
-      `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${filePath}`;
+      `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${telegramFile.file_path}`;
 
-    const upstream = await fetch(fileUrl);
+    const headers = {};
+
+    // Forward browser Range requests so video seeking works
+    if (req.headers.range) {
+      headers.Range = req.headers.range;
+    }
+
+    upstream = await fetch(fileUrl, { headers });
 
     if (!upstream.ok || !upstream.body) {
+      console.error('Telegram fetch failed:', upstream.status);
       return res.status(502).send('Telegram se video load nahi hui.');
     }
 
-    const contentType =
-      upstream.headers.get('content-type') || 'video/mp4';
+    // Preserve the upstream response status, including 206 Partial Content
+    res.status(upstream.status);
 
-    res.setHeader('Content-Type', contentType);
+    res.setHeader(
+      'Content-Type',
+      upstream.headers.get('content-type') || 'video/mp4'
+    );
+
     res.setHeader('Content-Disposition', 'inline');
     res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('Access-Control-Allow-Origin', '*');
 
     const contentLength = upstream.headers.get('content-length');
+    const contentRange = upstream.headers.get('content-range');
+    const acceptRanges = upstream.headers.get('accept-ranges');
+
     if (contentLength) {
       res.setHeader('Content-Length', contentLength);
     }
 
-    const contentRange = upstream.headers.get('content-range');
     if (contentRange) {
       res.setHeader('Content-Range', contentRange);
     }
 
-    const acceptRanges = upstream.headers.get('accept-ranges');
     if (acceptRanges) {
       res.setHeader('Accept-Ranges', acceptRanges);
     }
 
-    // Stream the video to the browser
-    const reader = upstream.body.getReader();
+    const nodeStream = Readable.fromWeb(upstream.body);
 
-    req.on('close', () => {
-      reader.cancel().catch(() => {});
+    // Stop streaming if the browser disconnects
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        nodeStream.destroy();
+      }
     });
 
-    while (true) {
-      const { done, value } = await reader.read();
-
-      if (done) break;
-      if (res.destroyed) break;
-
-      if (!res.write(Buffer.from(value))) {
-        await new Promise((resolve) => res.once('drain', resolve));
-      }
-    }
-
-    if (!res.destroyed) {
-      res.end();
-    }
+    await pipeline(nodeStream, res);
   } catch (error) {
-    console.error('Streaming error:', error);
+    console.error('Streaming error:', error.message);
 
     if (!res.headersSent) {
       res.status(500).send('Video play karne mein error aaya.');
-    } else {
+    } else if (!res.destroyed) {
       res.destroy();
     }
   }
 });
 
-// Start server and bot
+// Start server and Telegram bot
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
