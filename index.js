@@ -1,68 +1,53 @@
 const { Telegraf } = require('telegraf');
+const { createClient } = require('@supabase/supabase-js');
 const http = require('http');
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const BASE_URL = process.env.RENDER_EXTERNAL_URL;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!BOT_TOKEN || !BASE_URL) {
-  throw new Error('BOT_TOKEN aur RENDER_EXTERNAL_URL configure karo.');
+if (!BOT_TOKEN || !BASE_URL || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error('BOT_TOKEN, RENDER_EXTERNAL_URL aur Supabase variables check karo.');
 }
 
 const bot = new Telegraf(BOT_TOKEN);
-const DATA_DIR = process.env.DATA_DIR || './data';
-const DB_FILE = path.join(DATA_DIR, 'videos.json');
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-
-function loadVideos() {
-  try {
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  } catch {
-    return {};
-  }
-}
-
-let videos = loadVideos();
-
-function saveVideos() {
-  const temp = DB_FILE + '.tmp';
-  fs.writeFileSync(temp, JSON.stringify(videos, null, 2));
-  fs.renameSync(temp, DB_FILE);
-}
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY
+);
 
 bot.start(ctx => {
-  ctx.reply('Bot active hai! MP4 video upload karo.');
+  ctx.reply('Bot active hai! Gallery se video bhejo, link mil jayega.');
 });
 
+// Mobile gallery se Video ke roop mein bheji gayi files
 bot.on('video', async ctx => {
   try {
     const video = ctx.message.video;
-
-    if (!video.file_id) {
-      return ctx.reply('Video file ID nahi mila.');
-    }
-
     const key = crypto.randomBytes(24).toString('hex');
 
-    videos[key] = {
-      fileId: video.file_id,
-      createdAt: Date.now(),
-      mimeType: video.mime_type || 'video/mp4'
-    };
+    const { error } = await supabase
+      .from('videos')
+      .insert({
+        id: key,
+        file_id: video.file_id,
+        created_at: new Date().toISOString()
+      });
 
-    saveVideos();
+    if (error) {
+      console.error('Supabase insert error:', error.message);
+      return ctx.reply('Database mein save nahi hua. Admin ko logs check karne honge.');
+    }
 
     const link = `${BASE_URL.replace(/\/$/, '')}/video/${key}`;
 
-    await ctx.reply(
-      `Video link:\n${link}\n\nIs link ko apni website ke video player mein use karo.`
-    );
+    await ctx.reply(`Video link:\n${link}`);
   } catch (err) {
-    console.error('Video error:', err);
-    ctx.reply('Video link generate nahi hua. Render logs check karo.');
+    console.error('Video upload error:', err);
+    await ctx.reply('Video process nahi hui. Render logs check karo.');
   }
 });
 
@@ -81,24 +66,30 @@ const server = http.createServer(async (req, res) => {
     return res.end('Not found');
   }
 
-  const item = videos[match[1]];
-
-  if (!item) {
-    res.writeHead(404);
-    return res.end('Video link not found');
-  }
-
   try {
-    const file = await bot.telegram.getFile(item.fileId);
+    const { data: item, error } = await supabase
+      .from('videos')
+      .select('file_id')
+      .eq('id', match[1])
+      .maybeSingle();
 
+    if (error) {
+      console.error('Supabase lookup error:', error.message);
+      res.writeHead(500);
+      return res.end('Database lookup failed');
+    }
+
+    if (!item) {
+      res.writeHead(404);
+      return res.end('Video link not found');
+    }
+
+    const file = await bot.telegram.getFile(item.file_id);
     const telegramUrl =
       `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
 
     const headers = {};
-
-    if (req.headers.range) {
-      headers.Range = req.headers.range;
-    }
+    if (req.headers.range) headers.Range = req.headers.range;
 
     const upstream = await fetch(telegramUrl, { headers });
 
@@ -107,27 +98,23 @@ const server = http.createServer(async (req, res) => {
       return res.end('Telegram video fetch failed');
     }
 
+    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+
     const responseHeaders = {
-      'Content-Type': item.mimeType,
+      'Content-Type': contentType,
       'Cache-Control': 'no-store',
       'Accept-Ranges': 'bytes',
       'Access-Control-Allow-Origin': '*'
     };
 
-    for (const name of ['content-length', 'content-range', 'accept-ranges']) {
+    for (const name of ['content-length', 'content-range']) {
       const value = upstream.headers.get(name);
-      if (value) {
-        responseHeaders[name.replace(/(^|-)(\w)/g, (_, a, b) =>
-          a + b.toUpperCase()
-        )] = value;
-      }
+      if (value) responseHeaders[name] = value;
     }
 
     res.writeHead(upstream.status, responseHeaders);
 
-    if (!upstream.body) {
-      return res.end();
-    }
+    if (!upstream.body) return res.end();
 
     const reader = upstream.body.getReader();
 
@@ -137,9 +124,7 @@ const server = http.createServer(async (req, res) => {
 
     while (true) {
       const { done, value } = await reader.read();
-
-      if (done) break;
-      if (res.destroyed) break;
+      if (done || res.destroyed) break;
 
       if (!res.write(Buffer.from(value))) {
         await new Promise(resolve => res.once('drain', resolve));
