@@ -19,17 +19,33 @@ app.get('/', (req, res) => {
   res.send('Telegram video service running.');
 });
 
-// टेलीग्राम से वीडियो रिसीव करना और Supabase में सेव करना (अपरिवर्तित)
-bot.on('video', async (ctx) => {
+// 🛠️ फिक्स: अब यह नॉर्मल वीडियो, एनिमेटेड/म्यूट वीडियो (Animation) और फाइल वीडियो सबका लिंक बनाएगा
+bot.on(['video', 'animation', 'document'], async (ctx) => {
   try {
-    const video = ctx.message.video;
+    let videoData = null;
+
+    // टेलीग्राम संदेश के प्रकार की जांच करें
+    if (ctx.message.video) {
+      videoData = ctx.message.video;
+    } else if (ctx.message.animation) {
+      videoData = ctx.message.animation;
+    } else if (ctx.message.document && ctx.message.document.mime_type && ctx.message.document.mime_type.startsWith('video/')) {
+      videoData = ctx.message.document;
+    }
+
+    // अगर कोई भी वैलिड वीडियो ऑब्जेक्ट नहीं मिला, तो कोड यहीं रोक दें
+    if (!videoData || !videoData.file_id) {
+      return;
+    }
+
     const key = crypto.randomBytes(24).toString('hex');
 
+    // Supabase में डेटा सुरक्षित सेव करना (बिना पुराने डेटा को नुकसान पहुंचाए)
     const { error } = await supabase
       .from('videos')
       .insert({
         id: key,
-        file_id: video.file_id,
+        file_id: videoData.file_id,
         created_at: new Date().toISOString()
       });
 
@@ -47,7 +63,7 @@ bot.on('video', async (ctx) => {
   }
 });
 
-// मुख्य स्ट्रीमिंग रूट - वीडियो प्लेबैक फिक्स के साथ
+// मुख्य streaming रूट - वीडियो प्लेबैक फिक्स के साथ (यह पूरी तरह सुरक्षित और वर्किंग है)
 app.get('/video/:id', async (req, res) => {
   try {
     const { data, error } = await supabase
